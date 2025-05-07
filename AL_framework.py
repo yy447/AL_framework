@@ -129,7 +129,7 @@ class CVDLearner:
         """Compute scores for uncertainty, expected AUC gain, and diversity."""
         # Predict probabilities on training set
         proba = self.cvd_model.predict_proba(self.Z_train)[:, 1]
-        proba = np.clip(proba, 1e-10, 1 - 1e-10)  # 数值稳定
+        proba = np.clip(proba, 1e-10, 1 - 1e-10) 
 
         # Compute uncertainty using entropy
         uncertainty = -proba * np.log(proba) - (1 - proba) * np.log(1 - proba)
