@@ -413,30 +413,39 @@ class CVDALRLSystem:
         return auc_score
 
     def _compute_long_term_reward(self, new_auc):
-        cumulative_gain = 0.0
-        discount_factor = 1.0
-
-        for i in range(1, min(len(self.auc_window), self.reward_horizon + 1)):
-            gain = self.auc_window[-i] - self.auc_window[-i - 1]
-            cumulative_gain += discount_factor * gain
-            discount_factor *= self.reward_gamma
-
         # Add short-term incentive component (current AUC improvement)
         immediate_gain = new_auc - self.auc_window[-1] if self.auc_window else 0
 
-        # Mixed incentives (short-term bias in early years, long-term bias in later years)
-        progress = self.labeled_mask.sum() / self.budget
-        mixed_reward = (1 - progress) * immediate_gain + progress * cumulative_gain
+        # long-term rewards
+        future_gain = 0
+        if len(self.auc_history) > 5:
+            recent_auc = np.array(self.auc_history[-5:])
+            x = np.arange(len(recent_auc))
+            coef = np.polyfit(x, recent_auc, 1)[0]
+            future_gain = coef * 3
+
+        plateau_penalty = 0
+        if len(self.auc_window) > 10:
+            last_10_auc = np.array(self.auc_window)[-10:]
+            if np.std(last_10_auc) < 0.005:
+                plateau_penalty = -0.1
+
+        # Mixed incentives
+        total_reward = immediate_gain * 0.7 + future_gain * 0.3 + plateau_penalty
 
         # normalize rewards
-        normalized_reward = (mixed_reward - self.reward_stats["mean"]) / (
-            self.reward_stats["std"] + 1e-8
+        self.reward_stats["mean"] = 0.9 * self.reward_stats["mean"] + 0.1 * total_reward
+        self.reward_stats["std"] = 0.9 * self.reward_stats["std"] + 0.1 * abs(
+            total_reward
         )
 
-        self.reward_stats["mean"] = 0.9 * self.reward_stats["mean"] + 0.1 * mixed_reward
-        self.reward_stats["std"] = 0.9 * self.reward_stats["std"] + 0.1 * abs(
-            mixed_reward
+        normalized_reward = (total_reward - self.reward_stats["mean"]) / (
+            self.reward_stats["std"] + 1e-8
         )
+        print(
+            f"[REWARD DEBUG] immediate={immediate_gain:.4f}, future={future_gain:.4f}, plateau={plateau_penalty:.4f}, total={total_reward:.4f}, norm={normalized_reward:.4f}"
+        )
+        self.auc_window.append(new_auc)
 
         return normalized_reward
 
@@ -569,8 +578,8 @@ class CVDALRLSystem:
         # get new state
         next_state = self._get_current_state()
         # Calculating long-term rewards
-        total_reward = new_auc - current_auc
-
+        # total_reward = new_auc - current_auc
+        total_reward = self._compute_long_term_reward(new_auc)
         # Check for termination
         done = self.early_stop or (self.labeled_mask.sum() >= self.budget)
 

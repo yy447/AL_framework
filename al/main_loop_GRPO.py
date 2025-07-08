@@ -442,7 +442,9 @@ class CVDALRLSystem:
         normalized_reward = (total_reward - self.reward_stats["mean"]) / (
             self.reward_stats["std"] + 1e-8
         )
-
+        print(
+            f"[REWARD DEBUG] immediate={immediate_gain:.4f}, future={future_gain:.4f}, plateau={plateau_penalty:.4f}, total={total_reward:.4f}, norm={normalized_reward:.4f}"
+        )
         self.auc_window.append(new_auc)
 
         return normalized_reward
@@ -774,7 +776,7 @@ def main():
     # rl_config
     rl_config = {
         "budget": 200,
-        "batch_size": 10,
+        "batch_size": 25,
         "val_size": 0.2,
         "reward_horizon": 5,
         "reward_gamma": 0.85,
@@ -846,6 +848,8 @@ def main():
             )
 
             results = system.full_training_loop()
+            if strategy == "hybrid_rl":
+                system._plot_training_metrics()
             auc_history = [result["auc"] for result in results]
 
             if len(auc_history) < 20:
