@@ -27,6 +27,7 @@ from lifelines.utils import concordance_index
 from rl.agent import PPO
 from data.process_data import build_realdata_arrays
 
+
 # =========================
 # Real data config
 # =========================
@@ -37,21 +38,184 @@ SMOKING_STATUS_COL = "smoking_status"
 DEMO_COLS = ["age_at_index", "SEX", "RACE", "HISPANIC"]
 
 
-# ---------- small helpers ----------
+def generate_patients_ch(
+    n=1000,
+    d_X1=10,
+    d_X2=10,
+    beta_S_scale=1.5,
+    S_star_scale=2,
+    beta_Y_scale_X2=0.2,
+    beta_Y_scale_S=5.0,
+    seed=123,
+):
+    """Toy generator for synthetic patients."""
+    np.random.seed(seed)
+
+    # X1 drives S_true; X2 drives Y
+    X1 = np.random.normal(size=(n, d_X1))
+    X2 = np.random.normal(size=(n, d_X2))
+
+    # X1 -> S_true
+    beta_S = np.random.randn(d_X1) * beta_S_scale
+    s_logit = X1 @ beta_S + np.random.normal(scale=0.3, size=n)
+    p_S = 1 / (1 + np.exp(-s_logit))
+    S_true = np.random.binomial(1, p_S)
+    auc_s = roc_auc_score(S_true, p_S)
+
+    # S_true -> S_star (noisy proxy)
+    s_star_logit = S_true + np.random.normal(scale=S_star_scale, size=n)
+    S_star = 1 / (1 + np.exp(-s_star_logit))
+    auc_sstar = roc_auc_score(S_true, S_star)
+
+    # (S_true + X2) -> Y
+    y_coef_s = beta_Y_scale_S
+    y_coef_x2 = np.random.normal(scale=beta_Y_scale_X2, size=X2.shape[1])
+    y_logit = y_coef_s * S_true + X2 @ y_coef_x2 + np.random.normal(scale=0.5, size=n)
+    p_Y = 1 / (1 + np.exp(-y_logit))
+    Y = np.random.binomial(1, p_Y)
+    auc_y = roc_auc_score(Y, y_logit)
+
+    return X1, X2, Y, S_true, S_star, auc_s, auc_sstar, auc_y
+
+
+# ========== Utils ==========
 def safe_dense(m):
+    """Convert sparse to dense if needed."""
     if hasattr(m, "toarray"):
         return m.toarray()
     return np.asarray(m)
 
 
 def as_dataframe(Z, prefix):
+    """Convert array to DataFrame with prefix columns."""
     Z = safe_dense(Z)
     cols = [f"{prefix}_{i}" for i in range(Z.shape[1])]
     return pd.DataFrame(Z, columns=cols)
 
 
+def load_sim_arrays_for_run(
+    run_seed: int,
+    n: int = 1000,
+    d_X1: int = 10,
+    d_X2: int = 10,
+    beta_S_scale: float = 1.5,
+    S_star_scale: float = 2.0,
+    beta_Y_scale_X2: float = 0.2,
+    beta_Y_scale_S: float = 5.0,
+):
+    """Build synthetic arrays and a simple train/val split (stratified by Y)."""
+    X1, X2, Y, S_true, S_star, auc_s, auc_sstar, auc_y = generate_patients_ch(
+        n=n,
+        d_X1=d_X1,
+        d_X2=d_X2,
+        beta_S_scale=beta_S_scale,
+        S_star_scale=S_star_scale,
+        beta_Y_scale_X2=beta_Y_scale_X2,
+        beta_Y_scale_S=beta_Y_scale_S,
+        seed=run_seed,
+    )
+
+    idx_all = np.arange(len(Y))
+    idx_tr, idx_val = train_test_split(
+        idx_all, test_size=0.2, stratify=Y, random_state=run_seed
+    )
+
+    val_meta_df = pd.DataFrame({"y_true": Y[idx_val]})
+
+    return {
+        "X1": X1,
+        "X2": X2,
+        "Y": Y,
+        "S_true": S_true,
+        "S_star": S_star,
+        "idx_tr": idx_tr,
+        "idx_val": idx_val,
+        "T": None,
+        "val_meta_df": val_meta_df,
+        "auc_s_holdout": float(auc_s),
+        "auc_sstar_holdout": float(auc_sstar),
+        "auc_y_ref": float(auc_y),
+    }
+
+
+def load_real_arrays_for_run(run_seed: int):
+    """Load real dataset, split train/val, build feature arrays and quick ref AUC."""
+    if not os.path.exists(DATA_PATH):
+        raise FileNotFoundError(f"DATA_PATH not found: {DATA_PATH}")
+    df = pd.read_csv(DATA_PATH)
+
+    y_all = df[LABEL_COL].astype(int).values
+    t_all = df[TIME_COL].values if TIME_COL in df.columns else None
+
+    idx_all = np.arange(len(df))
+    idx_tr, idx_val = train_test_split(
+        idx_all, test_size=0.2, stratify=y_all, random_state=run_seed
+    )
+
+    X1, X2, Y, S_true, S_star, meta = build_realdata_arrays(
+        df,
+        label_col=LABEL_COL,
+        smoking_status_col=SMOKING_STATUS_COL,
+        demo_cols=DEMO_COLS,
+        idx_train=idx_tr,
+        random_state=run_seed,
+        verbose=False,
+    )
+
+    # quick outer AUC on (S_true + X2)
+    if X2.shape[1] > 0:
+        scaler_q = StandardScaler(with_mean=False).fit(X2[idx_tr])
+        X2_tr_s = scaler_q.transform(X2[idx_tr])
+        X2_val_s = scaler_q.transform(X2[idx_val])
+    else:
+        X2_tr_s = np.zeros((len(idx_tr), 0))
+        X2_val_s = np.zeros((len(idx_val), 0))
+
+    Z_tr_q = np.hstack([S_true[idx_tr].reshape(-1, 1), X2_tr_s])
+    Z_val_q = np.hstack([S_true[idx_val].reshape(-1, 1), X2_val_s])
+    clf_q = LogisticRegression(
+        max_iter=1000, class_weight="balanced", solver="liblinear"
+    )
+    clf_q.fit(Z_tr_q, Y[idx_tr])
+    p_val_q = clf_q.predict_proba(Z_val_q)[:, 1]
+    auc_y_ref = roc_auc_score(Y[idx_val], p_val_q)
+
+    pack = {
+        "X1": X1,
+        "X2": X2,
+        "Y": Y,
+        "S_true": S_true,
+        "S_star": S_star,
+        "idx_tr": idx_tr,
+        "idx_val": idx_val,
+        "auc_s_holdout": meta.get("auc_true_holdout", np.nan),
+        "auc_sstar_holdout": meta.get("auc_star_holdout", np.nan),
+        "auc_y_ref": auc_y_ref,
+    }
+    if t_all is not None:
+        pack["T"] = t_all
+
+    # meta for per-iteration dumps
+    meta_cols = [
+        "PATID",
+        "age_at_index",
+        "SEX",
+        "RACE",
+        "HISPANIC",
+        "smoking_status",
+        LABEL_COL,
+    ]
+    present = [c for c in meta_cols if c in df.columns]
+    val_meta_df = df.loc[idx_val, present].copy()
+    if LABEL_COL in val_meta_df.columns:
+        val_meta_df = val_meta_df.rename(columns={LABEL_COL: "y_true"})
+    pack["val_meta_df"] = val_meta_df.reset_index(drop=True)
+
+    return pack
+
+
+# >>> Classification metrics at FPR <= 0.1
 def compute_cls_metrics_from_proba(y_true, proba, target_fpr=0.10):
-    """Binary metrics at best threshold under FPR<=target."""
     y_true = np.asarray(y_true).astype(int)
     proba = np.asarray(proba).ravel()
     fpr, tpr, th = roc_curve(y_true, proba)
@@ -85,84 +249,9 @@ def compute_cls_metrics_from_proba(y_true, proba, target_fpr=0.10):
     }
 
 
-def load_real_arrays_for_run(run_seed: int):
-    """Load real data, split train/val, and compute a quick outer AUC(Y | S_true + X2)."""
-    if not os.path.exists(DATA_PATH):
-        raise FileNotFoundError(f"DATA_PATH not found: {DATA_PATH}")
-    df = pd.read_csv(DATA_PATH)
-
-    y_all = df[LABEL_COL].astype(int).values
-    t_all = df[TIME_COL].values if TIME_COL in df.columns else None
-
-    idx_all = np.arange(len(df))
-    idx_tr, idx_val = train_test_split(
-        idx_all, test_size=0.2, stratify=y_all, random_state=run_seed
-    )
-
-    X1, X2, Y, S_true, S_star, meta = build_realdata_arrays(
-        df,
-        label_col=LABEL_COL,
-        smoking_status_col=SMOKING_STATUS_COL,
-        demo_cols=DEMO_COLS,
-        idx_train=idx_tr,
-        random_state=run_seed,
-        verbose=False,
-    )
-
-    if X2.shape[1] > 0:
-        scaler_q = StandardScaler(with_mean=False).fit(X2[idx_tr])
-        X2_tr_s = scaler_q.transform(X2[idx_tr])
-        X2_val_s = scaler_q.transform(X2[idx_val])
-    else:
-        X2_tr_s = np.zeros((len(idx_tr), 0))
-        X2_val_s = np.zeros((len(idx_val), 0))
-
-    Z_tr_q = np.hstack([S_true[idx_tr].reshape(-1, 1), X2_tr_s])
-    Z_val_q = np.hstack([S_true[idx_val].reshape(-1, 1), X2_val_s])
-    clf_q = LogisticRegression(
-        max_iter=1000, class_weight="balanced", solver="liblinear"
-    )
-    clf_q.fit(Z_tr_q, Y[idx_tr])
-    p_val_q = clf_q.predict_proba(Z_val_q)[:, 1]
-    auc_y_ref = roc_auc_score(Y[idx_val], p_val_q)
-
-    pack = {
-        "X1": X1,
-        "X2": X2,
-        "Y": Y,
-        "S_true": S_true,
-        "S_star": S_star,
-        "idx_tr": idx_tr,
-        "idx_val": idx_val,
-        "auc_s_holdout": meta.get("auc_true_holdout", np.nan),
-        "auc_sstar_holdout": meta.get("auc_star_holdout", np.nan),
-        "auc_y_ref": auc_y_ref,
-    }
-    if t_all is not None:
-        pack["T"] = t_all
-
-    # meta for per-iteration dump (optional)
-    meta_cols = [
-        "PATID",
-        "age_at_index",
-        "SEX",
-        "RACE",
-        "HISPANIC",
-        "smoking_status",
-        LABEL_COL,
-    ]
-    present = [c for c in meta_cols if c in df.columns]
-    val_meta_df = df.loc[idx_val, present].copy()
-    if LABEL_COL in val_meta_df.columns:
-        val_meta_df = val_meta_df.rename(columns={LABEL_COL: "y_true"})
-    pack["val_meta_df"] = val_meta_df.reset_index(drop=True)
-
-    return pack
-
-
 # -------- Cox helpers --------
 def _sanitize_times_for_cox(T, E, jitter_eps=1e-6):
-    """Clean times and add tiny jitter if too few unique times."""
+    """Filter invalid durations and optionally jitter ties."""
     T = np.asarray(T, dtype=float)
     E = np.asarray(E, dtype=int)
     finite = np.isfinite(T)
@@ -176,7 +265,7 @@ def _sanitize_times_for_cox(T, E, jitter_eps=1e-6):
 
 
 def _drop_sparse_columns(df_tr, min_nnz_frac=0.01):
-    """Drop features with too few non-zeros."""
+    """Keep z_* features with enough non-zeros."""
     feats = [c for c in df_tr.columns if c.startswith("z_")]
     if not feats:
         return df_tr, feats
@@ -192,7 +281,7 @@ def _drop_sparse_columns(df_tr, min_nnz_frac=0.01):
 
 
 def _drop_low_variance_columns(df_tr, min_std=1e-8):
-    """Drop features with near-zero global or class-conditional variance."""
+    """Keep z_* features with non-trivial variance, overall or by event group."""
     feats = [c for c in df_tr.columns if c.startswith("z_")]
     if not feats:
         return df_tr, feats
@@ -212,7 +301,7 @@ def _drop_low_variance_columns(df_tr, min_std=1e-8):
 
 
 def _select_features_by_univariate_cox(df_tr, max_k=30):
-    """Univariate Cox pre-filtering; keep top-k by p-value."""
+    """Univariate Cox pre-screening to select top-k features by p-value."""
     feats = [c for c in df_tr.columns if c.startswith("z_")]
     if not feats:
         return df_tr, feats
@@ -238,7 +327,7 @@ def _select_features_by_univariate_cox(df_tr, max_k=30):
 
 
 def _enough_comparable_pairs(T, E):
-    """Quick check for valid C-index computation."""
+    """Quick check for enough comparable pairs for C-index."""
     T = np.asarray(T)
     E = np.asarray(E).astype(int)
     finite = np.isfinite(T)
@@ -251,8 +340,10 @@ def _enough_comparable_pairs(T, E):
     return True
 
 
-# ---------- normalization for RL state ----------
+# ========== State normalizer ==========
 class StateNormalizer:
+    """EMA-based online state standardization with clipping."""
+
     def __init__(
         self, state_dim, min_window_size=20, clip_range=(-5, 5), ema_alpha=0.05
     ):
@@ -287,17 +378,15 @@ class StateNormalizer:
             self.state_std = np.sqrt(np.maximum(variance, 1e-6))
 
 
-# =========================
-# Main AL/RL system
-# =========================
+# ========== Main AL/RL system ==========
 class CVDALRLSystem:
     """
-    mode='auc'    -> logistic/AUC; C-index = nan
-    mode='cindex' -> Cox/C-index; AUC = nan
+    mode='auc'    -> train/eval logistic only (classification metrics), C-index is NaN
+    mode='cindex' -> train/eval Cox only (C-index), classification metrics are NaN
     """
 
     def __init__(self, data, config):
-        # data
+        # ---- Core data ----
         self.X1 = data["X1"]
         self.X2 = data["X2"]
         self.S_true = data["S_true"]
@@ -306,17 +395,16 @@ class CVDALRLSystem:
         self.T = data.get("T", None)
         self.val_meta_df = data.get("val_meta_df", None)
 
-        # cache for dumps
+        # caches
         self._last_val_proba = None
         self._last_val_risk = None
         self._last_val_time = None
         self._last_val_event = None
         self._last_keep_va = None
-
         self.idx_train_ext = data.get("idx_train", None)
         self.idx_val_ext = data.get("idx_val", None)
 
-        # config
+        # ---- Config ----
         self.config = config
         self.mode = config.get("mode", "auc").lower()
         assert self.mode in ("auc", "cindex")
@@ -331,6 +419,7 @@ class CVDALRLSystem:
         self.reward_gamma = float(config.get("reward_gamma", 0.9))
         self.strategy = config.get("strategy", "rl")
         self.ppo_rollout = int(config.get("ppo_rollout", 5))
+        self.warmup_iters = int(config.get("warmup_iters", 0))
 
         # Cox params
         self.cox_penalizer = float(config.get("cox_penalizer", 0.05))
@@ -341,41 +430,47 @@ class CVDALRLSystem:
         self.cox_jitter_eps = float(config.get("cox_jitter_eps", 1e-6))
         self.cox_features = config.get("cox_features", "S+X2")
 
-        # history
+        # ---- History ----
         self.auc_history: List[float] = []
         self.cindex_history: List[float] = []
+        self.selection_history = []
         self.iteration = 0
         self.early_stop = False
         self._last_proba_mse = np.nan
         self._last_cls_metrics = None
 
-        # agent
+        # ---- RL agent or fixed strategy ----
         if self.strategy != "rl":
-            self.fixed_strategy = (
-                self.strategy
-                if self.strategy in ["random", "uncertainty", "diversity", "qbc"]
-                else "uncertainty"
-            )
+            if self.strategy in ["random", "uncertainty", "diversity", "qbc"]:
+                self.fixed_strategy = self.strategy
+            elif self.strategy == "equal":
+                self.fixed_strategy = np.array([1 / 3, 1 / 3, 1 / 3], dtype=float)
+            else:
+                self.fixed_strategy = "uncertainty"
             self.agent = None
         else:
-            state_dim = 13
+            state_dim = 8
             self.agent = PPO(state_dim, {**config, "action_dim": 3})
 
         self._traj_steps = 0
         self.state_normalizer = StateNormalizer(
-            state_dim=13, min_window_size=20, clip_range=(-5, 5), ema_alpha=0.05
+            state_dim=8, min_window_size=20, clip_range=(-5, 5), ema_alpha=0.05
         )
+
+        # reward cache
         self.metric_window = deque(maxlen=self.reward_horizon + 1)
         self.reward_stats = {"mean": 0, "std": 1}
 
-        # splits/models/log dir
+        # ---- Setup ----
         self._initialize_data_splits()
         self._initialize_models()
         self._init_log_dir()
 
-    # ---------- logging ----------
+    # ----------------- per-iteration logging -----------------
     def _init_log_dir(self):
-        root = self.config.get("iter_log_root", os.path.join("outputs", "iter_logs"))
+        root = self.config.get(
+            "iter_log_root", os.path.join("outputs_simulation", "iter_logs")
+        )
         strat_label = self.config.get("strategy_label", self.strategy)
         run_id = f"run_{self.random_state}"
         self.log_dir = os.path.join(root, strat_label, run_id)
@@ -386,25 +481,55 @@ class CVDALRLSystem:
             pd.DataFrame(columns=["iteration", "indices"]).to_csv(
                 self.sel_csv_path, index=False
             )
-
-        self.proba_dir = os.path.join("outputs", "probabilities", strat_label, run_id)
+        self.proba_dir = os.path.join(
+            "outputs_simulation", "probabilities", strat_label, run_id
+        )
         os.makedirs(self.proba_dir, exist_ok=True)
         self.proba_all_csv = os.path.join(self.proba_dir, "all_iters.csv")
-
-        self.risk_dir = os.path.join("outputs", "risks", strat_label, run_id)
+        self.risk_dir = os.path.join("outputs_simulation", "risks", strat_label, run_id)
         os.makedirs(self.risk_dir, exist_ok=True)
         self.risk_all_csv = os.path.join(self.risk_dir, "all_iters.csv")
 
     def _cls_metrics_from_proba(self, y_true, proba, target_fpr=0.10):
-        return compute_cls_metrics_from_proba(y_true, proba, target_fpr)
+        """Same as global helper, kept local for minimal dependency."""
+        y_true = np.asarray(y_true).astype(int)
+        fpr, tpr, th = roc_curve(y_true, proba)
+        ok = np.where(fpr <= target_fpr)[0]
+        if ok.size > 0:
+            i = ok[np.argmax(tpr[ok])]
+            thr = float(th[i])
+            fpr_at_thr = float(fpr[i])
+            tpr_at_thr = float(tpr[i])
+        else:
+            thr = 0.5
+            preds_tmp = (proba >= thr).astype(int)
+            tn, fp, fn, tp = confusion_matrix(y_true, preds_tmp, labels=[0, 1]).ravel()
+            fpr_at_thr = float(fp / (fp + tn + 1e-8))
+            tpr_at_thr = float(tp / (tp + fn + 1e-8))
+        preds = (proba >= thr).astype(int)
+        ppv = float(precision_score(y_true, preds, zero_division=0))
+        rec = float(recall_score(y_true, preds, zero_division=0))
+        f1 = float(f1_score(y_true, preds, zero_division=0))
+        tn, fp, fn, tp = confusion_matrix(y_true, preds, labels=[0, 1]).ravel()
+        return {
+            "thr_at_fpr_0.1": thr,
+            "fpr_at_thr": fpr_at_thr,
+            "tpr_at_thr": rec,
+            "ppv_at_thr": ppv,
+            "f1_at_thr": f1,
+            "tn": int(tn),
+            "fp": int(fp),
+            "fn": int(fn),
+            "tp": int(tp),
+        }
 
     def _log_iteration(self, weights=None, selected_indices=None):
-        # dump per-iteration proba/risk if available
+        """Write per-iteration probability/risk and summary CSV rows."""
         if (self.mode == "auc") and (self._last_val_proba is not None):
             try:
                 self._dump_val_probabilities(self._last_val_proba)
             except Exception as e:
-                print(f"[warn] dump probabilities failed: {e}")
+                print(f"[warn] failed to dump per-iteration probabilities: {e}")
         if (
             (self.mode == "cindex")
             and (self._last_val_risk is not None)
@@ -414,12 +539,12 @@ class CVDALRLSystem:
             try:
                 self._dump_val_risks()
             except Exception as e:
-                print(f"[warn] dump risks failed: {e}")
+                print(f"[warn] failed to dump per-iteration risks: {e}")
 
         auc_val = self.auc_history[-1] if len(self.auc_history) else np.nan
         cidx_val = self.cindex_history[-1] if len(self.cindex_history) else np.nan
-        cls = self._last_cls_metrics if self.mode == "auc" else None
 
+        cls = self._last_cls_metrics if self.mode == "auc" else None
         row = {
             "iteration": int(self.iteration),
             "num_labeled": int(self.labeled_mask.sum()),
@@ -427,37 +552,39 @@ class CVDALRLSystem:
             "strategy_internal": self.strategy,
             "auc": float(auc_val) if np.isfinite(auc_val) else np.nan,
             "cindex": float(cidx_val) if np.isfinite(cidx_val) else np.nan,
-            "thr_at_fpr_0.1": np.nan,
-            "fpr_at_thr": np.nan,
-            "tpr_at_thr": np.nan,
-            "ppv_at_thr": np.nan,
-            "f1_at_thr": np.nan,
-            "tn": np.nan,
-            "fp": np.nan,
-            "fn": np.nan,
-            "tp": np.nan,
-            "mse_val": float(np.mean((self.S_star_val - self.S_true_val) ** 2)),
-            "mse_proba_val": float(self._last_proba_mse)
-            if (self.mode == "auc" and np.isfinite(self._last_proba_mse))
-            else np.nan,
-            "w_uncertainty": np.nan,
-            "w_diversity": np.nan,
-            "w_qbc": np.nan,
         }
         if cls is not None:
+            row.update(cls)
+        else:
             row.update(
                 {
-                    "thr_at_fpr_0.1": cls["thr_at_fpr_0p1"],
-                    "fpr_at_thr": cls["fpr_at_thr"],
-                    "tpr_at_thr": cls["tpr_at_thr"],
-                    "ppv_at_thr": cls["ppv_at_thr"],
-                    "f1_at_thr": cls["f1_at_thr"],
-                    "tn": cls["tn"],
-                    "fp": cls["fp"],
-                    "fn": cls["fn"],
-                    "tp": cls["tp"],
+                    "thr_at_fpr_0.1": np.nan,
+                    "fpr_at_thr": np.nan,
+                    "tpr_at_thr": np.nan,
+                    "ppv_at_thr": np.nan,
+                    "f1_at_thr": np.nan,
+                    "tn": np.nan,
+                    "fp": np.nan,
+                    "fn": np.nan,
+                    "tp": np.nan,
                 }
             )
+
+        if (~self.labeled_mask).any():
+            u = ~self.labeled_mask
+            row["mse_train_unlabeled"] = float(
+                np.mean((self.S_star_train[u] - self.S_true_train[u]) ** 2)
+            )
+        else:
+            row["mse_train_unlabeled"] = np.nan
+
+        row["mse_val"] = float(np.mean((self.S_star_val - self.S_true_val) ** 2))
+        row["mse_proba_val"] = (
+            float(self._last_proba_mse)
+            if (self.mode == "auc" and np.isfinite(self._last_proba_mse))
+            else np.nan
+        )
+
         if weights is not None:
             w = np.asarray(weights, dtype=float).ravel()
             row.update(
@@ -467,6 +594,10 @@ class CVDALRLSystem:
                     "w_qbc": w[2] if w.size > 2 else np.nan,
                 }
             )
+        else:
+            row.update(
+                {"w_uncertainty": np.nan, "w_diversity": np.nan, "w_qbc": np.nan}
+            )
 
         pd.DataFrame([row]).to_csv(
             self.log_csv_path,
@@ -474,7 +605,6 @@ class CVDALRLSystem:
             mode=("a" if os.path.exists(self.log_csv_path) else "w"),
             header=not os.path.exists(self.log_csv_path),
         )
-
         if selected_indices is not None and len(selected_indices) > 0:
             pd.DataFrame(
                 [
@@ -488,6 +618,7 @@ class CVDALRLSystem:
             ).to_csv(self.sel_csv_path, index=False, mode="a", header=False)
 
     def _dump_val_probabilities(self, proba: np.ndarray):
+        """Dump per-iteration validation probabilities."""
         if self.mode != "auc":
             return
         if self.val_meta_df is not None and len(self.val_meta_df) == len(proba):
@@ -506,12 +637,14 @@ class CVDALRLSystem:
 
         per_iter_path = os.path.join(self.proba_dir, f"iter_{self.iteration:03d}.csv")
         df_out.to_csv(per_iter_path, index=False)
+
         if os.path.exists(self.proba_all_csv):
             df_out.to_csv(self.proba_all_csv, index=False, mode="a", header=False)
         else:
             df_out.to_csv(self.proba_all_csv, index=False)
 
     def _dump_val_risks(self):
+        """Dump per-iteration validation risk scores (Cox)."""
         if self.mode != "cindex":
             return
         risk = np.asarray(self._last_val_risk).ravel()
@@ -540,14 +673,16 @@ class CVDALRLSystem:
 
         per_iter_path = os.path.join(self.risk_dir, f"iter_{self.iteration:03d}.csv")
         df_out.to_csv(per_iter_path, index=False)
+
         if os.path.exists(self.risk_all_csv):
             df_out.to_csv(self.risk_all_csv, index=False, mode="a", header=False)
         else:
             df_out.to_csv(self.risk_all_csv, index=False)
 
-    # ---------- init ----------
+    # ----------------- init -----------------
     def _initialize_data_splits(self):
-        # split
+        """Train/val split, state mirrors for train/val, scalers, optional seeding."""
+        # 1) split
         if (self.idx_train_ext is not None) and (self.idx_val_ext is not None):
             self.idx_train = np.asarray(self.idx_train_ext)
             self.idx_val = np.asarray(self.idx_val_ext)
@@ -560,7 +695,7 @@ class CVDALRLSystem:
                 random_state=self.random_state,
             )
 
-        # slice
+        # 2) slice arrays
         self.X2_train = self.X2[self.idx_train]
         self.X2_val = self.X2[self.idx_val]
         self.S_star_train = self.S_star[self.idx_train]
@@ -576,27 +711,31 @@ class CVDALRLSystem:
             self.T_train = None
             self.T_val = None
 
-        # train starts from S*; val mirrors the same correction path
+        # 3) train pool state: start with S*, replace with S_true when selected
         self.labeled_mask = np.zeros(len(self.idx_train), dtype=bool)
         self.S_train = self.S_star_train.copy()
+
+        # 4) validation mirror state: start with S*_val, replace to S_true_val
         self.val_labeled_mask = np.zeros(len(self.idx_val), dtype=bool)
         self.S_val = self.S_star_val.copy()
-
         self.val_budget = int(self.config.get("val_budget", self.budget))
         self.val_batch_size = int(self.config.get("val_batch_size", self.batch_size))
 
-        # scaler (fit on train only)
+        # scaler on train only
         self.scaler = StandardScaler(with_mean=False).fit(self.X2_train)
         self.X2_train_scaled = self.scaler.transform(self.X2_train)
         self.X2_val_scaled = self.scaler.transform(self.X2_val)
 
+        # optional seeding
         if self.initial_samples > 0:
             self._init_seed_samples()
 
     def _init_seed_samples(self):
+        """Optional cold-start: label a small balanced set by S_true."""
         rng = np.random.RandomState(self.random_state)
         pos_idx_S = np.where(self.S_true_train >= 0.5)[0]
         neg_idx_S = np.where(self.S_true_train < 0.5)[0]
+
         n_per_class = min(self.initial_samples // 2, len(pos_idx_S), len(neg_idx_S))
         if n_per_class <= 0:
             seed_idx = rng.choice(
@@ -611,14 +750,16 @@ class CVDALRLSystem:
                     rng.choice(neg_idx_S, n_per_class, replace=False),
                 ]
             )
+
         seed_idx = np.unique(seed_idx)
         if seed_idx.size == 0:
             return
+
         self.labeled_mask[seed_idx] = True
         self.S_train[seed_idx] = self.S_true_train[seed_idx]
 
     def _initialize_models(self):
-        """Init selection model and first evaluation (iteration 0)."""
+        """Init selection model and initial evaluation with current S_train."""
         self.selection_model = LogisticRegression(
             max_iter=500, class_weight="balanced", solver="liblinear"
         )
@@ -630,14 +771,16 @@ class CVDALRLSystem:
         self.cindex_history.append(c0)
         self.metric_window.append(self._reward_metric_value(a0, c0))
 
-    # ---------- feature builder ----------
+    # ----------------- Z builders (Cox/logit) -----------------
     def _build_Z(self, split="train", for_model="cox"):
+        """Compose [S, X2] (or each alone) for train/val, depending on config."""
         feats = self.cox_features if for_model == "cox" else "S+X2"
+
         if split == "train":
             S = self.S_train.reshape(-1, 1)
             X = self.X2_train_scaled
         elif split == "val":
-            S = self.S_val.reshape(-1, 1)  # mirror evolution on val
+            S = self.S_val.reshape(-1, 1)  # use evolving mirror on val
             X = self.X2_val_scaled
         else:
             raise ValueError(f"Unknown split: {split}")
@@ -649,7 +792,7 @@ class CVDALRLSystem:
         else:
             return np.hstack([S, X])
 
-    # ---------- evaluation ----------
+    # ----------------- Evaluation (mutually exclusive paths) -----------------
     def _evaluate_current(self) -> Tuple[float, float]:
         if self.mode == "auc":
             Z_tr = self._build_Z(split="train", for_model="logit")
@@ -666,7 +809,7 @@ class CVDALRLSystem:
                 proba = clf.predict_proba(Z_va)[:, 1]
                 auc = float(roc_auc_score(self.Y_val, proba))
             except Exception as e:
-                print(f"[WARN] Logistic failed: {e}")
+                print(f"[WARN] LogisticRegression failed: {e}")
                 auc = 0.5
                 proba = np.full(len(self.Y_val), 0.5)
 
@@ -677,9 +820,13 @@ class CVDALRLSystem:
             self._last_val_proba = proba
             return auc, np.nan
 
-        # Cox / c-index
+        # Cox / C-index path
         if (self.T_train is None) or (self.T_val is None) or (len(self.Y_train) < 5):
-            self._clear_cox_cache()
+            self._last_cls_metrics = None
+            self._last_val_risk = None
+            self._last_val_time = None
+            self._last_val_event = None
+            self._last_keep_va = None
             return np.nan, 0.5
 
         Z_tr = self._build_Z(split="train", for_model="cox")
@@ -697,7 +844,11 @@ class CVDALRLSystem:
         if not _enough_comparable_pairs(T_tr, E_tr) or not _enough_comparable_pairs(
             T_va, E_va
         ):
-            self._clear_cox_cache()
+            self._last_cls_metrics = None
+            self._last_val_risk = None
+            self._last_val_time = None
+            self._last_val_event = None
+            self._last_keep_va = None
             return np.nan, 0.5
 
         df_tr = pd.DataFrame({"time": T_tr, "event": E_tr})
@@ -707,13 +858,21 @@ class CVDALRLSystem:
 
         df_tr, kept = _drop_sparse_columns(df_tr, min_nnz_frac=self.cox_min_nnz_frac)
         if not kept:
-            self._clear_cox_cache()
+            self._last_cls_metrics = None
+            self._last_val_risk = None
+            self._last_val_time = None
+            self._last_val_event = None
+            self._last_keep_va = None
             return np.nan, 0.5
         df_va = df_va[["time", "event"] + kept]
 
         df_tr, kept2 = _drop_low_variance_columns(df_tr, min_std=self.cox_min_std)
         if not kept2:
-            self._clear_cox_cache()
+            self._last_cls_metrics = None
+            self._last_val_risk = None
+            self._last_val_time = None
+            self._last_val_event = None
+            self._last_keep_va = None
             return np.nan, 0.5
         df_va = df_va[["time", "event"] + kept2]
 
@@ -741,21 +900,17 @@ class CVDALRLSystem:
             self._last_val_event = df_va["event"].to_numpy()
             self._last_keep_va = keep_va
         except Exception as e:
-            print(f"[WARN] Cox failed: {e}")
-            self._clear_cox_cache()
+            print(f"[WARN] CoxPHFitter failed: {e}")
             c_index = 0.5
+            self._last_val_risk = None
+            self._last_val_time = None
+            self._last_val_event = None
+            self._last_keep_va = None
 
         self._last_cls_metrics = None
         return np.nan, c_index
 
-    def _clear_cox_cache(self):
-        self._last_cls_metrics = None
-        self._last_val_risk = None
-        self._last_val_time = None
-        self._last_val_event = None
-        self._last_keep_va = None
-
-    # ---------- views ----------
+    # ----------------- Common views/ranking -----------------
     def _current_pool_views(self, split="train"):
         if split == "train":
             return (
@@ -777,6 +932,7 @@ class CVDALRLSystem:
             raise ValueError(split)
 
     def _rank01_unlabeled_generic(self, v, labeled_mask):
+        """Rank to [0,1] on unlabeled items only."""
         v = np.asarray(v, dtype=float)
         out = np.zeros_like(v, dtype=float)
         mask = ~labeled_mask
@@ -787,8 +943,9 @@ class CVDALRLSystem:
         out[mask] = order.astype(float) / denom
         return out
 
-    # ---------- scoring (train) ----------
+    # ----------------- Scoring on train -----------------
     def _compute_uncertainty_scores(self):
+        """Entropy of predicted probability on unlabeled train pool."""
         unlabeled_mask = ~self.labeled_mask
         scores = np.zeros(len(self.S_train))
         if not unlabeled_mask.any():
@@ -800,6 +957,7 @@ class CVDALRLSystem:
             ]
         )
         if not hasattr(self.selection_model, "classes_"):
+            scores[unlabeled_mask] = 0.0
             return scores
         try:
             proba = self.selection_model.predict_proba(Z_unlabeled)[:, 1]
@@ -807,10 +965,11 @@ class CVDALRLSystem:
             entropy = -proba * np.log(proba) - (1 - proba) * np.log(1 - proba)
             scores[unlabeled_mask] = entropy
         except Exception:
-            pass
+            scores[unlabeled_mask] = 0.0
         return scores
 
     def _compute_diversity_scores(self, k=10):
+        """Avg+std cosine distance to labeled set in normalized [S, X2]."""
         scores = np.zeros(len(self.S_train))
         unlabeled_mask = ~self.labeled_mask
         if not unlabeled_mask.any():
@@ -832,10 +991,11 @@ class CVDALRLSystem:
             diversity = distances.mean(axis=1) + 0.5 * distances.std(axis=1)
             scores[unlabeled_mask] = diversity
         except Exception:
-            pass
+            scores[unlabeled_mask] = 0.0
         return scores
 
     def _compute_qbc_scores(self, n_committee=5):
+        """Variance across bootstrap committee probabilities (query-by-committee)."""
         scores = np.zeros(len(self.S_train))
         unlabeled_mask = ~self.labeled_mask
         if not unlabeled_mask.any():
@@ -874,12 +1034,12 @@ class CVDALRLSystem:
                 p = np.full(Z_unl.shape[0], 0.5)
             probs.append(p)
 
-        P = np.vstack(probs) if len(probs) else np.zeros((1, Z_unl.shape[0]))
+        P = np.vstack(probs)  # (B, U)
         var_p = np.var(P, axis=0)
         scores[unlabeled_mask] = var_p
         return scores
 
-    # ---------- scoring (val mirror) ----------
+    # ----------------- Scoring on a given split (mirror for val) -----------------
     def _compute_uncertainty_scores_on(self, split="val"):
         S, X, labeled_mask, _, _ = self._current_pool_views(split)
         scores = np.zeros_like(S, dtype=float)
@@ -896,6 +1056,8 @@ class CVDALRLSystem:
         return scores
 
     def _compute_diversity_scores_on(self, split="val", k=10):
+        from sklearn.preprocessing import normalize as _norm
+
         S, X, labeled_mask, _, _ = self._current_pool_views(split)
         scores = np.zeros_like(S, dtype=float)
         if (~labeled_mask).sum() == 0:
@@ -904,7 +1066,7 @@ class CVDALRLSystem:
             scores[~labeled_mask] = 1.0
             return scores
         Z = np.hstack([S.reshape(-1, 1), safe_dense(X)])
-        Z = normalize(Z)
+        Z = _norm(Z)
         Z_sel = Z[labeled_mask]
         nbrs = NearestNeighbors(
             n_neighbors=min(k, len(Z_sel)), metric="cosine", algorithm="auto"
@@ -924,6 +1086,7 @@ class CVDALRLSystem:
         if (~labeled_mask).sum() == 0:
             return scores
 
+        # committee is trained on train split, scored on target split
         Z_tr = np.hstack([self.S_train.reshape(-1, 1), self.X2_train_scaled])
         y_tr = self.Y_train
         Z_unl = np.hstack([S[~labeled_mask].reshape(-1, 1), X[~labeled_mask]])
@@ -957,9 +1120,9 @@ class CVDALRLSystem:
         scores[~labeled_mask] = var_p
         return scores
 
-    # ---------- selection ----------
+    # ----------------- Selection (train + mirror for val) -----------------
     def select_samples(self, strategy_or_weights):
-        """Select on train pool."""
+        """Select indices on TRAIN pool based on a single strategy or a weighted mix."""
         if isinstance(strategy_or_weights, str):
             name = strategy_or_weights.lower()
             if name == "random":
@@ -985,7 +1148,7 @@ class CVDALRLSystem:
             s_rank[idx_unlab] = s_rank[idx_unlab] + eps * rng.rand(idx_unlab.size)
             return idx_unlab[np.argsort(-s_rank[idx_unlab])[:k]]
 
-        # weighted mix of [uncertainty, diversity, qbc]
+        # weighted mixture of [uncertainty, diversity, qbc]
         w = np.asarray(strategy_or_weights, dtype=float).ravel()
         if w.size != 3:
             raise ValueError("weights must be length-3 [uncertainty, diversity, qbc]")
@@ -1014,7 +1177,7 @@ class CVDALRLSystem:
         return idx_unlab[np.argsort(-combined[idx_unlab])[:k]]
 
     def select_samples_on(self, split, strategy_or_weights):
-        """Select on a given split (train/val), used for validation mirroring."""
+        """Select indices on given split (train/val). Used to mirror val labeling."""
         S, X, labeled_mask, budget, batch_size = self._current_pool_views(split)
 
         if isinstance(strategy_or_weights, str):
@@ -1060,7 +1223,7 @@ class CVDALRLSystem:
         s_rank[idx_unlab] = s_rank[idx_unlab] + eps * rng.rand(idx_unlab.size)
         return idx_unlab[np.argsort(-s_rank[idx_unlab])[:k]]
 
-    # ---------- rewards ----------
+    # ------- Reward helpers -------
     def _reward_metric_value(self, auc, cindex):
         return float(auc) if self.reward_metric == "auc" else float(cindex)
 
@@ -1068,20 +1231,17 @@ class CVDALRLSystem:
         return self.auc_history if self.reward_metric == "auc" else self.cindex_history
 
     def _compute_long_term_reward(self, new_value):
-        """Normalized long-horizon reward w.r.t. moving baseline."""
+        """Relative gain vs. moving baseline, with progress/trend factors."""
         baseline = np.mean(self.metric_window) if self.metric_window else 0.5
         relative_gain = (new_value - baseline) / (1.0 - baseline + 1e-8)
         progress = self.labeled_mask.sum() / self.budget
-        trend_factor = (
-            1.2
-            if (
-                len(self.metric_window) > 3
-                and np.array(list(self.metric_window)[-3:] + [new_value])[-1]
-                > np.array(list(self.metric_window)[-3:] + [new_value])[0]
-            )
-            else 1.0
-        )
-        total_reward = relative_gain * (1.0 + 2.0 * progress) * trend_factor
+        progress_factor = 1.0 + 2.0 * progress
+        trend_factor = 1.0
+        if len(self.metric_window) > 3:
+            recent = np.array(list(self.metric_window)[-3:] + [new_value])
+            if recent[-1] > recent[0]:
+                trend_factor = 1.2
+        total_reward = relative_gain * progress_factor * trend_factor
         self.reward_stats["mean"] = 0.9 * self.reward_stats["mean"] + 0.1 * total_reward
         self.reward_stats["std"] = 0.9 * self.reward_stats["std"] + 0.1 * abs(
             total_reward
@@ -1089,33 +1249,65 @@ class CVDALRLSystem:
         normalized_reward = (total_reward - self.reward_stats["mean"]) / (
             self.reward_stats["std"] + 1e-8
         )
+        print(
+            f"[REWARD] value={new_value:.4f}, base={baseline:.4f}, gain={relative_gain:.4f}, "
+            f"progress={progress:.2f}, reward={total_reward:.4f}, norm={normalized_reward:.4f}"
+        )
         self.metric_window.append(new_value)
         return float(normalized_reward)
 
-    # ---------- update / one epoch ----------
+    # ----------------- Update models -----------------
     def update_models(self, selected_indices):
+        """Apply new labels on train, refit selection model, evaluate."""
         if len(selected_indices) > 0:
-            # replace S* with S_true on selected train samples
             self.S_train[selected_indices] = self.S_true_train[selected_indices]
             self.labeled_mask[selected_indices] = True
 
-        # refit selection model on entire train pool (current S_train + X2)
         Z_train = np.hstack([self.S_train.reshape(-1, 1), self.X2_train_scaled])
         try:
             self.selection_model.fit(Z_train, self.Y_train)
         except Exception as e:
-            print(f"[WARN] selection model update failed: {e}")
+            print(f"[WARN] Selection model update failed: {e}")
 
         a, c = self._evaluate_current()
         self.auc_history.append(a)
         self.cindex_history.append(c)
         return a, c
 
+    # ----------------- One AL epoch -----------------
     def run_al_epoch(self):
+        """One active learning step including val mirror and logging."""
         if self.early_stop or self.labeled_mask.sum() >= self.budget:
             return None
 
-        # fixed strategies
+        # warm-up for RL (optional): use diversity for a few steps
+        if (self.strategy == "rl") and (self.iteration < self.warmup_iters):
+            selected_tr = self.select_samples("diversity")
+            selected_va = self.select_samples_on("val", "diversity")
+            if len(selected_va) > 0:
+                self.S_val[selected_va] = self.S_true_val[selected_va]
+                self.val_labeled_mask[selected_va] = True
+
+            a, c = self.update_models(selected_tr)
+            new_val = self._reward_metric_value(a, c)
+            reward = float(
+                new_val - (self.metric_window[-1] if self.metric_window else 0.5)
+            )
+            self.metric_window.append(new_val)
+
+            self.iteration += 1
+            self._check_early_stopping()
+            self._log_iteration(weights=None, selected_indices=selected_tr)
+            return {
+                "iteration": self.iteration,
+                "auc": a,
+                "cindex": c,
+                "reward": reward,
+                "strategy_weights": np.array([0, 1, 0], dtype=float),
+                "num_labeled": self.labeled_mask.sum(),
+            }
+
+        # fixed strategies (non-RL)
         if self.strategy != "rl":
             selected_tr = self.select_samples(self.strategy)
             selected_va = self.select_samples_on("val", self.strategy)
@@ -1174,6 +1366,7 @@ class CVDALRLSystem:
         done = self.early_stop or (self.labeled_mask.sum() >= self.budget)
         self.agent.buffer.rewards.append(reward)
         self.agent.buffer.is_terminals.append(done)
+
         self._traj_steps += 1
         if self._traj_steps >= self.ppo_rollout or done:
             self.agent.update()
@@ -1182,6 +1375,7 @@ class CVDALRLSystem:
         self.iteration += 1
         self._check_early_stopping()
         self._log_iteration(weights=weights, selected_indices=selected_tr)
+
         return {
             "iteration": self.iteration,
             "auc": a,
@@ -1191,82 +1385,41 @@ class CVDALRLSystem:
             "num_labeled": self.labeled_mask.sum(),
         }
 
-    # ---------- RL state / early stop ----------
+    # ----------------- Helpers -----------------
     def _get_current_state(self):
-        """
-        Build a 13-dim state:
-        [unc_q50, unc_q80, unc_mean,
-        div_q50, div_q80, div_mean,
-        qbc_q50, qbc_q80, qbc_mean,
-        pos_rate_labeled, hist_slope, hist_var, budget_left]
-        """
+        """Build an 8-dim state for RL: stats of scores, class balance, trend, budget left."""
         unl = ~self.labeled_mask
+        ent = self._compute_uncertainty_scores()[unl]
+        div = self._compute_diversity_scores()[unl]
+        qbc = self._compute_qbc_scores()[unl]
 
-        # -- compute three score arrays on the currently unlabeled train pool
-        unc_all = self._compute_uncertainty_scores()
-        div_all = self._compute_diversity_scores()
-        qbc_all = self._compute_qbc_scores()
+        q50_ent = float(np.median(ent)) if ent.size else 0.0
+        q80_ent = float(np.quantile(ent, 0.8)) if ent.size else 0.0
+        mean_div = float(np.mean(div)) if div.size else 0.0
+        q80_qbc = float(np.quantile(qbc, 0.8)) if qbc.size else 0.0
 
-        unc = np.asarray(unc_all[unl], dtype=float)
-        div = np.asarray(div_all[unl], dtype=float)
-        qbc = np.asarray(qbc_all[unl], dtype=float)
+        pos_rate = (
+            float((self.S_train[self.labeled_mask] >= 0.5).mean())
+            if self.labeled_mask.any()
+            else 0.5
+        )
 
-        def _q50_q80_mean(x):
-            if x.size == 0:
-                return 0.0, 0.0, 0.0
-            x = x[np.isfinite(x)]
-            if x.size == 0:
-                return 0.0, 0.0, 0.0
-            return (
-                float(np.quantile(x, 0.50)),
-                float(np.quantile(x, 0.80)),
-                float(np.mean(x)),
-            )
-
-        unc_q50, unc_q80, unc_mean = _q50_q80_mean(unc)
-        div_q50, div_q80, div_mean = _q50_q80_mean(div)
-        qbc_q50, qbc_q80, qbc_mean = _q50_q80_mean(qbc)
-
-        # fraction of positives among labeled S (avoid empty)
-        if self.labeled_mask.any():
-            pos_rate = float((self.S_train[self.labeled_mask] >= 0.5).mean())
-        else:
-            pos_rate = 0.5
-
-        # short-term trend from recent reward metric history
         hist = self._reward_history()
         slope, var_m = 0.0, 0.0
         if len(hist) >= 5:
-            y = np.array(hist[-5:], dtype=float)
-            x = np.arange(len(y), dtype=float)
+            y = np.array(hist[-5:])
+            x = np.arange(len(y))
             slope = float(np.polyfit(x, y, 1)[0])
             var_m = float(np.var(y))
 
         budget_left = 1.0 - self.labeled_mask.sum() / max(1, self.budget)
-
         state = np.array(
-            [
-                unc_q50,
-                unc_q80,
-                unc_mean,
-                div_q50,
-                div_q80,
-                div_mean,
-                qbc_q50,
-                qbc_q80,
-                qbc_mean,
-                pos_rate,
-                slope,
-                var_m,
-                budget_left,
-            ],
-            dtype=float,
+            [q50_ent, q80_ent, mean_div, q80_qbc, pos_rate, slope, var_m, budget_left]
         )
-
-        state = np.nan_to_num(state, nan=0.0, posinf=0.0, neginf=0.0)
         return self.state_normalizer.normalize(state)
 
     def _check_early_stopping(self, patience=15, min_improvement=0.001):
+        """Stop when progress plateaus late in budget."""
         hist = self._reward_history()
         progress = self.labeled_mask.sum() / self.budget
         if progress < 0.5 or len(hist) < patience + 5:
@@ -1283,6 +1436,7 @@ class CVDALRLSystem:
             self.early_stop = True
 
     def full_training_loop(self):
+        """Run AL until budget or early stopping."""
         results = []
         start = time.time()
         print(f"Starting Active Learning Training... (mode={self.mode})")
@@ -1299,9 +1453,12 @@ class CVDALRLSystem:
             sw = r["strategy_weights"]
             sw_str = "None" if sw is None else np.round(sw, 3)
             print(
-                f"Iter {r['iteration']:03d}: {metric_str} | Reward={r['reward']:.4f} | Strategy={sw_str} | Labeled={r['num_labeled']}/{self.budget}"
+                f"Iter {r['iteration']:03d}: {metric_str} | "
+                f"Reward={r['reward']:.4f} | Strategy={sw_str} | "
+                f"Labeled={r['num_labeled']}/{self.budget} | "
             )
-        print(f"Training completed in {time.time() - start:.2f} seconds")
+        dur = time.time() - start
+        print(f"Training completed in {dur:.2f} seconds")
         return results
 
 
@@ -1331,18 +1488,19 @@ def main():
 
     rl_config = {
         "mode": "auc",  # 'auc' or 'cindex'
-        "budget": 2500,
-        "batch_size": 100,
+        "budget": 300,  # total label budget on train pool
+        "batch_size": 15,  # max labels per AL iteration
         "val_size": 0.2,
         "reward_horizon": 5,
-        "reward_gamma": 0.9,
-        "lr_actor": 0.0002,
+        "reward_gamma": 0.85,
+        "lr_actor": 0.0001,
         "lr_critic": 0.0005,
         "K_epochs": 4,
-        "entropy_coef": 0.005,
-        "initial_samples": 150,
+        "entropy_coef": 0.01,
+        "initial_samples": 0,
         "ppo_rollout": 16,
         "action_dim": 3,
+        "warmup_iters": 0,
         # Cox
         "cox_penalizer": 0.05,
         "cox_l1_ratio": 0.9,
@@ -1353,7 +1511,7 @@ def main():
         "cox_features": "S+X2",
     }
 
-    n_runs = 10
+    n_runs = 100
     strategy_auc_histories: Dict[str, List[List[float]]] = {s: [] for s in strategies}
     strategy_cidx_histories: Dict[str, List[List[float]]] = {s: [] for s in strategies}
     auc_s_list, auc_sstar_list, auc_y_list = [], [], []
@@ -1366,7 +1524,7 @@ def main():
         all_auc_runs, all_cidx_runs = [], []
 
         for run in range(n_runs):
-            pack = load_real_arrays_for_run(run)
+            pack = load_sim_arrays_for_run(run)
             X1, X2, Y = pack["X1"], pack["X2"], pack["Y"]
             S_true, S_star = pack["S_true"], pack["S_star"]
             idx_train, idx_val = pack["idx_tr"], pack["idx_val"]
@@ -1376,7 +1534,7 @@ def main():
             auc_sstar_list.append(pack["auc_sstar_holdout"])
             auc_y_list.append(pack["auc_y_ref"])
 
-            # scaler for baselines
+            # standardize X2 for baselines
             if X2.shape[1] > 0:
                 scaler = StandardScaler(with_mean=False).fit(X2[idx_train])
                 X2_train_s = scaler.transform(X2[idx_train])
@@ -1385,7 +1543,7 @@ def main():
                 X2_train_s = np.zeros((len(idx_train), 0))
                 X2_val_s = np.zeros((len(idx_val), 0))
 
-            # ----- baselines -----
+            # ====== baselines (no AL) ======
             if strategy in ["S_star_baseline", "S_true_oracle"]:
                 S_used_train = (
                     S_star[idx_train]
@@ -1413,12 +1571,12 @@ def main():
                         auc_val = 0.5
                     cidx_val = np.nan
 
-                    # dump iter_000 probas
                     val_meta_df = pack.get("val_meta_df", None)
                     proba_dir = os.path.join(
-                        "outputs", "probabilities", strategy, f"run_{run}"
+                        "outputs_simulation", "probabilities", strategy, f"run_{run}"
                     )
                     os.makedirs(proba_dir, exist_ok=True)
+
                     if (val_meta_df is not None) and (
                         len(val_meta_df) == len(proba_val)
                     ):
@@ -1427,6 +1585,7 @@ def main():
                             df_meta["y_true"] = Y[idx_val]
                     else:
                         df_meta = pd.DataFrame({"y_true": Y[idx_val]})
+
                     df_out = df_meta.copy()
                     df_out["proba"] = np.asarray(proba_val).ravel()
                     df_out["iteration"] = 0
@@ -1441,65 +1600,53 @@ def main():
                     else:
                         df_out.to_csv(all_csv, index=False)
 
-                    # per-iter metrics
                     cls = compute_cls_metrics_from_proba(
                         Y[idx_val], proba_val, target_fpr=0.10
                     )
                     mse_val = float(np.mean((S_star[idx_val] - S_true[idx_val]) ** 2))
                     mse_proba_val = float(np.mean((proba_val - Y[idx_val]) ** 2))
+
                     log_dir = os.path.join(
-                        "outputs", "iter_logs", strategy, f"run_{run}"
+                        "outputs_simulation", "iter_logs", strategy, f"run_{run}"
                     )
                     os.makedirs(log_dir, exist_ok=True)
                     log_csv = os.path.join(log_dir, "per_iter_metrics.csv")
-                    pd.DataFrame(
-                        [
-                            {
-                                "iteration": 0,
-                                "num_labeled": 0,
-                                "strategy_label": strategy,
-                                "strategy_internal": strategy,
-                                "auc": auc_val if np.isfinite(auc_val) else np.nan,
-                                "cindex": np.nan,
-                                "thr_at_fpr_0.1": cls["thr_at_fpr_0p1"],
-                                "fpr_at_thr": cls["fpr_at_thr"],
-                                "tpr_at_thr": cls["tpr_at_thr"],
-                                "ppv_at_thr": cls["ppv_at_thr"],
-                                "f1_at_thr": cls["f1_at_thr"],
-                                "tn": cls["tn"],
-                                "fp": cls["fp"],
-                                "fn": cls["fn"],
-                                "tp": cls["tp"],
-                                "mse_val": mse_val,
-                                "mse_proba_val": mse_proba_val,
-                                "w_uncertainty": np.nan,
-                                "w_diversity": np.nan,
-                                "w_qbc": np.nan,
-                            }
-                        ]
-                    ).to_csv(log_csv, index=False)
+                    row = {
+                        "iteration": 0,
+                        "num_labeled": 0,
+                        "strategy_label": strategy,
+                        "strategy_internal": strategy,
+                        "auc": auc_val if np.isfinite(auc_val) else np.nan,
+                        "cindex": np.nan,
+                        "thr_at_fpr_0p1": cls["thr_at_fpr_0p1"],
+                        "fpr_at_thr": cls["fpr_at_thr"],
+                        "tpr_at_thr": cls["tpr_at_thr"],
+                        "ppv_at_thr": cls["ppv_at_thr"],
+                        "f1_at_thr": cls["f1_at_thr"],
+                        "tn": cls["tn"],
+                        "fp": cls["fp"],
+                        "fn": cls["fn"],
+                        "tp": cls["tp"],
+                        "mse_val": mse_val,
+                        "mse_proba_val": mse_proba_val,
+                        "w_uncertainty": np.nan,
+                        "w_diversity": np.nan,
+                        "w_qbc": np.nan,
+                    }
+                    pd.DataFrame([row]).to_csv(log_csv, index=False)
 
                 else:
                     # cindex baseline
                     if T is not None:
-                        Z_train_cox = (
-                            Z_train
-                            if rl_config["cox_features"] == "S+X2"
-                            else (
-                                S_used_train.reshape(-1, 1)
-                                if rl_config["cox_features"] == "S_only"
-                                else X2_train_s
-                            )
-                        )
-                        Z_val_cox = (
-                            Z_val
-                            if rl_config["cox_features"] == "S+X2"
-                            else (
-                                S_used_val.reshape(-1, 1)
-                                if rl_config["cox_features"] == "S_only"
-                                else X2_val_s
-                            )
-                        )
+                        if rl_config["cox_features"] == "S_only":
+                            Z_train_cox = S_used_train.reshape(-1, 1)
+                            Z_val_cox = S_used_val.reshape(-1, 1)
+                        elif rl_config["cox_features"] == "X2_only":
+                            Z_train_cox = X2_train_s
+                            Z_val_cox = X2_val_s
+                        else:
+                            Z_train_cox = Z_train
+                            Z_val_cox = Z_val
 
                         T_tr, E_tr, keep_tr = _sanitize_times_for_cox(
                             T[idx_train],
@@ -1568,9 +1715,11 @@ def main():
                                                 df_val["event"],
                                             )
                                         )
-                                        # dump iter_000 risks
                                         risk_dir = os.path.join(
-                                            "outputs", "risks", strategy, f"run_{run}"
+                                            "outputs_simulation",
+                                            "risks",
+                                            strategy,
+                                            f"run_{run}",
                                         )
                                         os.makedirs(risk_dir, exist_ok=True)
                                         val_meta_df = pack.get("val_meta_df", None)
@@ -1627,7 +1776,7 @@ def main():
                 all_cidx_runs.append([cidx_val] * max_len)
                 continue
 
-            # ----- AL/RL flow -----
+            # ====== AL / RL system ======
             data = {
                 "X1": X1,
                 "X2": X2,
@@ -1643,13 +1792,14 @@ def main():
                 data["val_meta_df"] = pack["val_meta_df"]
 
             config_strategy = "rl" if strategy == "hybrid_rl" else strategy
+
             system = CVDALRLSystem(
                 data=data,
                 config={
                     **rl_config,
                     "strategy": config_strategy,
                     "strategy_label": strategy,
-                    "iter_log_root": os.path.join("outputs", "iter_logs"),
+                    "iter_log_root": os.path.join("outputs_simulation", "iter_logs"),
                     "random_state": run,
                 },
             )
@@ -1671,8 +1821,9 @@ def main():
 
     print(f"\nTotal experiment time: {time.time() - start_time:.2f} seconds")
 
-    # ---------- padding ----------
+    # ---------- helper to pad ----------
     def pad_to_matrix(histories):
+        """Pad per-run histories to same length by repeating the last value."""
         nonempty_lengths = [len(r) for r in histories if len(r) > 0]
         max_len = max(nonempty_lengths) if nonempty_lengths else 1
         padded = []
@@ -1686,22 +1837,27 @@ def main():
                 padded.append(row[:max_len])
         return np.array(padded, dtype=float), max_len
 
-    os.makedirs("outputs", exist_ok=True)
+    os.makedirs("outputs_simulation", exist_ok=True)
 
-    # ---------- multi-metric figure (if available) ----------
+    # ================= Faceted figure: metrics vs. iteration (mean ± 95% CI) =================
     strategy_histories_all = {
-        "AUC": strategy_auc_histories,
-        "C-index": strategy_cidx_histories,
-        # (F1/TPR/PPV/MSE were not fully tracked run-by-run in this script; keep placeholders if needed later)
+        "AUC": locals().get("strategy_auc_histories", {}),
+        "C-index": locals().get("strategy_cidx_histories", {}),
+        "F1": locals().get("strategy_f1_histories", {}),
+        "TPR": locals().get("strategy_tpr_histories", {}),
+        "PPV": locals().get("strategy_ppv_histories", {}),
+        "MSE": locals().get("strategy_mse_histories", {}),
     }
 
     metrics_to_plot = []
     for m, d in strategy_histories_all.items():
         if isinstance(d, dict) and len(d) > 0:
-            any_valid = any(
-                np.isfinite(pad_to_matrix(histories)[0]).any()
-                for _, histories in d.items()
-            )
+            any_valid = False
+            for _, histories in d.items():
+                A, _ = pad_to_matrix(histories)
+                if np.isfinite(A).any():
+                    any_valid = True
+                    break
             if any_valid:
                 metrics_to_plot.append(m)
 
@@ -1709,6 +1865,7 @@ def main():
         n_panels = len(metrics_to_plot)
         ncols = min(3, n_panels)
         nrows = int(np.ceil(n_panels / ncols))
+
         fig, axes = plt.subplots(
             nrows, ncols, figsize=(4.0 * ncols + 2, 3.2 * nrows + 1), squeeze=False
         )
@@ -1721,10 +1878,12 @@ def main():
                     continue
                 mean = np.nanmean(A, axis=0)
                 std = np.nanstd(A, axis=0)
-                nval = np.clip(np.sum(~np.isnan(A), axis=0), 1, None)
+                nval = np.sum(~np.isnan(A), axis=0)
+                nval = np.clip(nval, 1, None)
                 ci = 1.96 * std / np.sqrt(nval)
                 x = np.arange(len(mean))
                 color = strategy_colors.get(strategy, None)
+
                 ax.plot(x, mean, label=strategy, color=color, linewidth=2.0, alpha=0.95)
                 ax.fill_between(x, mean - ci, mean + ci, alpha=0.2, color=color)
                 ax.text(
@@ -1735,6 +1894,7 @@ def main():
                     fontsize=9,
                     va="center",
                 )
+
             ax.set_xlabel("AL Iteration")
             ax.grid(True, alpha=0.3)
             ax.set_ylabel(metric_name)
@@ -1773,16 +1933,19 @@ def main():
             )
             plt.subplots_adjust(bottom=0.12)
 
-        fig_path = os.path.join(
-            "outputs", f"metrics_over_iterations_{time.strftime('%Y%m%d-%H%M%S')}.png"
-        )
         plt.tight_layout()
+        os.makedirs("outputs_simulation", exist_ok=True)
+        fig_path = os.path.join(
+            "outputs_simulation",
+            f"metrics_over_iterations_{time.strftime('%Y%m%d-%H%M%S')}.png",
+        )
         plt.savefig(fig_path, dpi=300, bbox_inches="tight")
         print(f"[Saved] {fig_path}")
         plt.close(fig)
 
-    # ---------- final summaries ----------
+    # ================= Final metrics summary (CSV + console) =================
     def _final_value_per_run(run_hist):
+        """Return the last non-NaN value of a run history."""
         arr = np.array(run_hist, dtype=float)
         if arr.size == 0 or np.all(np.isnan(arr)):
             return np.nan
@@ -1813,8 +1976,8 @@ def main():
             )
 
     final_df_all = pd.DataFrame(final_rows_all).sort_values(["metric", "strategy"])
-    os.makedirs("outputs", exist_ok=True)
-    final_all_csv = os.path.join("outputs", "final_metrics_summary.csv")
+    os.makedirs("outputs_simulation", exist_ok=True)
+    final_all_csv = os.path.join("outputs_simulation", "final_metrics_summary.csv")
     final_df_all.to_csv(final_all_csv, index=False)
     print(f"[Saved] {final_all_csv}")
 
@@ -1822,34 +1985,36 @@ def main():
         final_auc_df = final_df_all.query("metric == 'AUC'")[
             ["strategy", "final_mean", "final_std", "n_runs"]
         ].rename(columns={"final_mean": "final_auc_mean", "final_std": "final_auc_std"})
-        final_auc_csv = os.path.join("outputs", "final_auc_summary.csv")
+        final_auc_csv = os.path.join("outputs_simulation", "final_auc_summary.csv")
         final_auc_df.to_csv(final_auc_csv, index=False)
         print(f"[Saved] {final_auc_csv}")
 
-    if (
-        "C-index" in strategy_histories_all
-        and len(strategy_histories_all["C-index"]) > 0
-    ):
+    if ("C-index" in strategy_histories_all) and len(
+        strategy_histories_all["C-index"]
+    ) > 0:
         final_cidx_df = final_df_all.query("metric == 'C-index'")[
             ["strategy", "final_mean", "final_std", "n_runs"]
         ].rename(
             columns={"final_mean": "final_cindex_mean", "final_std": "final_cindex_std"}
         )
-        final_cidx_csv = os.path.join("outputs", "final_cindex_summary.csv")
+        final_cidx_csv = os.path.join("outputs_simulation", "final_cindex_summary.csv")
         final_cidx_df.to_csv(final_cidx_csv, index=False)
         print(f"[Saved] {final_cidx_csv}")
 
     print("\n=== Final Metrics Summary (mean ± std) ===")
-    for metric_name in ["AUC", "C-index"]:
+    for metric_name in metrics_to_plot:
         sub = final_df_all[final_df_all["metric"] == metric_name]
         if sub.empty:
             continue
         print(f"\n-- {metric_name} --")
         for _, row in sub.iterrows():
-            m, s, n = row["final_mean"], row["final_std"], int(row["n_runs"])
-            print(
-                f"{row['strategy']:>18}: {'nan' if np.isnan(m) else f'{m:.4f} ± {s:.4f} (n={n})'}"
-            )
+            m = row["final_mean"]
+            s = row["final_std"]
+            n = int(row["n_runs"])
+            if np.isnan(m):
+                print(f"{row['strategy']:>18}: nan")
+            else:
+                print(f"{row['strategy']:>18}: {m:.4f} ± {s:.4f} (n={n})")
 
     print("\n=== Data Quality Summary (per-run references) ===")
     try:

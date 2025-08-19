@@ -1,0 +1,29 @@
+﻿# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual env
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+
+outputs/
+outputs_simulation/
+probabilities/
+risks/
+auc_comparison_*.png
+
+data/
+*.csv
+
+.DS_Store
+Thumbs.db
